@@ -84,9 +84,16 @@ pub(crate) struct Scope<'a> {
     pub report: &'a mut Report,
     /// Sanitize: remove hidden text (invisible render modes, or wholly outside this page box).
     pub hidden_text: Option<[f64; 4]>,
-    /// Sanitize: optional content groups (and membership dictionaries) that are off; content
-    /// marked with them is removed.
-    pub hidden_layers: Vec<ObjRef>,
+    /// Sanitize: optional content groups that are off; content marked with them is removed.
+    pub hidden_layers: HashSet<ObjRef>,
+    /// Whether this pass is evaluating optional-content rules. An empty off set is meaningful:
+    /// policies such as `/AllOff` can still hide content when every group is on.
+    pub layers_enabled: bool,
+    /// Off groups referenced by optional content that remains visible and therefore still needs
+    /// its original default state after sanitization.
+    pub retained_off_layers: HashSet<ObjRef>,
+    /// Cache membership results so repeated blocks cannot repeatedly walk hostile expressions.
+    ocmd_cache: HashMap<ObjRef, bool>,
     /// Content removed from hidden layers (blocks and XObjects).
     pub layer_blocks: usize,
     fonts: HashMap<Vec<u8>, Rc<Metrics>>,
@@ -101,7 +108,10 @@ impl<'a> Scope<'a> {
             mode,
             report,
             hidden_text: None,
-            hidden_layers: Vec::new(),
+            hidden_layers: HashSet::new(),
+            layers_enabled: false,
+            retained_off_layers: HashSet::new(),
+            ocmd_cache: HashMap::new(),
             layer_blocks: 0,
             fonts: HashMap::new(),
             used_names: Vec::new(),
@@ -111,18 +121,23 @@ impl<'a> Scope<'a> {
 
     /// Sanitizing visits every form XObject (not only those under a region).
     fn everywhere(&self) -> bool {
-        self.hidden_text.is_some() || !self.hidden_layers.is_empty()
+        self.hidden_text.is_some() || self.layers_enabled
     }
 
     /// Is this optional-content reference (an OCG or OCMD) hidden?
-    fn layer_hidden(&self, doc: &Document, o: &Object) -> bool {
-        if self.hidden_layers.is_empty() {
+    fn layer_hidden(&mut self, doc: &Document, o: &Object) -> bool {
+        if !self.layers_enabled {
             return false;
         }
-        if let Some(r) = o.as_ref()
-            && self.hidden_layers.contains(&r)
-        {
-            return true;
+        let reference = o.as_ref();
+        if let Some(r) = reference {
+            if let Some(hidden) = self.ocmd_cache.get(&r) {
+                return *hidden;
+            }
+            if self.hidden_layers.contains(&r) {
+                self.ocmd_cache.insert(r, true);
+                return true;
+            }
         }
         // Evaluate the policy against the same default configuration used to select hidden
         // groups. A membership dictionary's default policy is AnyOn.
@@ -137,29 +152,92 @@ impl<'a> Scope<'a> {
             None => Vec::new(),
         };
         let fail_closed = || groups.iter().any(|g| self.hidden_layers.contains(g));
-        if let Some(expression) = d.get(b"VE") {
+        let hidden = if let Some(expression) = d.get(b"VE") {
             let visible = self.visibility_expression(doc, expression, 0, &mut HashSet::new(), &mut 4096);
-            return !visible
-                .unwrap_or_else(|| !fail_closed() && !self.expression_mentions_hidden(doc, expression, 0, &mut HashSet::new(), &mut 4096));
+            match visible {
+                Some(visible) => !visible,
+                None => fail_closed() || self.expression_mentions_hidden(doc, expression, 0, &mut HashSet::new(), &mut 4096),
+            }
+        } else if groups.is_empty() {
+            false
+        } else {
+            let any_on = groups.iter().any(|g| !self.hidden_layers.contains(g));
+            let all_on = groups.iter().all(|g| !self.hidden_layers.contains(g));
+            let policy = d.get(b"P").map(|p| doc.resolve(p)).and_then(|p| p.as_name().map(|name| name.to_vec()));
+            match (d.get(b"P"), policy.as_deref()) {
+                (None, _) | (Some(_), Some(b"AnyOn")) => !any_on,
+                (Some(_), Some(b"AllOn")) => !all_on,
+                (Some(_), Some(b"AnyOff")) => all_on,
+                (Some(_), Some(b"AllOff")) => any_on,
+                // An invalid policy must not make a candidate hidden block survive sanitization.
+                _ => fail_closed(),
+            }
+        };
+        if !hidden {
+            self.retained_off_layers.extend(groups.iter().filter(|g| self.hidden_layers.contains(g)).copied());
+            if let Some(expression) = d.get(b"VE") {
+                let mut referenced = HashSet::new();
+                if Self::collect_hidden_expression_groups(doc, expression, &self.hidden_layers, 0, &mut HashSet::new(), &mut 4096, &mut referenced) {
+                    self.retained_off_layers.extend(referenced);
+                } else {
+                    // If an expression cannot be fully walked, preserve every off group so that
+                    // the content we kept does not change visibility after configuration cleanup.
+                    self.retained_off_layers.extend(self.hidden_layers.iter().copied());
+                }
+            }
         }
-        if groups.is_empty() {
+        if let Some(r) = reference {
+            self.ocmd_cache.insert(r, hidden);
+        }
+        hidden
+    }
+
+    fn collect_hidden_expression_groups(
+        doc: &Document,
+        expression: &Object,
+        hidden_layers: &HashSet<ObjRef>,
+        depth: usize,
+        path: &mut HashSet<ObjRef>,
+        budget: &mut usize,
+        found: &mut HashSet<ObjRef>,
+    ) -> bool {
+        if depth > 64 || *budget == 0 {
             return false;
         }
-        let any_on = groups.iter().any(|g| !self.hidden_layers.contains(g));
-        let all_on = groups.iter().all(|g| !self.hidden_layers.contains(g));
-        let policy = match d.get(b"P") {
-            None => b"AnyOn".as_slice(),
-            Some(Object::Name(name)) => name.as_slice(),
-            Some(_) => return fail_closed(),
-        };
-        match policy {
-            b"AnyOn" => !any_on,
-            b"AllOn" => !all_on,
-            b"AnyOff" => all_on,
-            b"AllOff" => any_on,
-            // An invalid policy must not make a candidate hidden block survive sanitization.
-            _ => fail_closed(),
+        *budget -= 1;
+        let reference = expression.as_ref();
+        if let Some(r) = reference
+            && !path.insert(r)
+        {
+            return false;
         }
+        let resolved = doc.resolve(expression);
+        let complete = match &*resolved {
+            Object::Dict(d) if d.name(b"Type") == Some(b"OCG") => {
+                if let Some(r) = reference
+                    && hidden_layers.contains(&r)
+                {
+                    found.insert(r);
+                }
+                reference.is_some()
+            }
+            Object::Array(items) => {
+                let Some(Object::Name(operator)) = items.first() else { return false };
+                let operands = match operator.as_slice() {
+                    b"And" | b"Or" if (2..=4097).contains(&items.len()) => items.get(1..),
+                    b"Not" if items.len() == 2 => items.get(1..),
+                    _ => None,
+                };
+                operands.is_some_and(|operands| {
+                    operands.iter().all(|item| Self::collect_hidden_expression_groups(doc, item, hidden_layers, depth + 1, path, budget, found))
+                })
+            }
+            _ => false,
+        };
+        if let Some(r) = reference {
+            path.remove(&r);
+        }
+        complete
     }
 
     /// Evaluate an optional-content visibility expression (`/VE`) against the default config.
@@ -191,14 +269,14 @@ impl<'a> Scope<'a> {
                     _ => return None,
                 };
                 match operator {
-                    b"And" if items.len() >= 3 => {
+                    b"And" if items.len() >= 2 => {
                         let mut visible = true;
                         for item in items.iter().skip(1) {
                             visible &= self.visibility_expression(doc, item, depth + 1, path, budget)?;
                         }
                         Some(visible)
                     }
-                    b"Or" if items.len() >= 3 => {
+                    b"Or" if items.len() >= 2 => {
                         let mut visible = false;
                         for item in items.iter().skip(1) {
                             visible |= self.visibility_expression(doc, item, depth + 1, path, budget)?;
@@ -641,7 +719,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     // Layer removal also changes enclosing replacement spans, so remember the operators before
     // any cleanup, not just the survivors of the layer pass.
     let original = parsed.ops.clone();
-    if !scope.hidden_layers.is_empty() {
+    if scope.layers_enabled {
         let props = res_dict(doc, resources, b"Properties");
         let (kept, removed) = strip_hidden_layers(doc, scope, parsed.ops, &props);
         parsed.ops = kept;
@@ -1180,7 +1258,7 @@ fn xobject(
 
 /// Remove marked-content blocks of hidden layers (`/OC /name BDC … EMC`, nested blocks
 /// included). Returns the remaining operators and how many blocks went.
-fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &Dict) -> (Vec<Op>, usize) {
+fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, props: &Dict) -> (Vec<Op>, usize) {
     let mut out = Vec::with_capacity(ops.len());
     // For each open marked-content block: does it hide its contents?
     let mut stack: Vec<bool> = Vec::new();

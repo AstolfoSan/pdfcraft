@@ -570,6 +570,116 @@ fn hidden_ocmd_content_in_a_form_and_nested_marked_blocks_is_removed() {
 }
 
 #[test]
+fn hidden_ocmd_alloff_is_sanitized_when_every_group_is_on() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+
+    let mut doc = one_page(
+        b"/OC /M BDC BT /F1 10 Tf 10 100 Td (SECRET) Tj ET EMC",
+        "/Properties << /M 9 0 R >>",
+        vec![
+            b"<< /Type /OCG /Name (On) >>".to_vec(),
+            b"<< /Type /OCG /Name (Unused) >>".to_vec(),
+            b"<< /Type /OCMD /OCGs [7 0 R] /P /AllOff >>".to_vec(),
+        ],
+    );
+    let counts = scan(&doc);
+    assert!(counts.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{counts:?}");
+    remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    assert!(!pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("SECRET")));
+}
+
+#[test]
+fn hidden_ve_not_is_sanitized_when_its_group_is_on() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+
+    let mut doc = one_page(
+        b"/OC /M BDC BT /F1 10 Tf 10 100 Td (SECRET) Tj ET EMC",
+        "/Properties << /M 9 0 R >>",
+        vec![b"<< /Type /OCG /Name (On) >>".to_vec(), b"<< /Type /OCG /Name (Unused) >>".to_vec(), b"<< /Type /OCMD /VE [/Not 7 0 R] >>".to_vec()],
+    );
+    let counts = scan(&doc);
+    assert!(counts.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{counts:?}");
+    remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    assert!(!pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("SECRET")));
+}
+
+#[test]
+fn hidden_ocmd_resolves_an_indirect_policy_name() {
+    use crate::sanitize::{Hidden, remove_hidden};
+
+    let mut doc = one_page(
+        b"/OC /M BDC BT /F1 10 Tf 10 100 Td (VISIBLE) Tj ET EMC",
+        "/Properties << /M 9 0 R >>",
+        vec![
+            b"<< /Type /OCG /Name (On) >>".to_vec(),
+            b"<< /Type /OCG /Name (Off) >>".to_vec(),
+            b"<< /Type /OCMD /OCGs [7 0 R 8 0 R] /P 12 0 R >>".to_vec(),
+        ],
+    );
+    doc.set(ObjRef::new(12, 0), Object::name("AnyOn"));
+    let root = doc.root().unwrap();
+    doc.update_dict(root, |d| {
+        d.set(
+            b"OCProperties".to_vec(),
+            Object::Dict(Dict::from_iter([
+                (b"OCGs".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(7, 0)), Object::Ref(ObjRef::new(8, 0))])),
+                (b"D".to_vec(), Object::Dict(Dict::from_iter([(b"OFF".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(8, 0))]))]))),
+            ])),
+        );
+    })
+    .unwrap();
+
+    remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    assert!(pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("VISIBLE")));
+}
+
+#[test]
+fn surviving_anyoff_and_not_content_keeps_its_off_group_state() {
+    use crate::sanitize::{Hidden, remove_hidden};
+
+    for use_not in [false, true] {
+        let mut doc = one_page(
+            b"/OC /M BDC BT /F1 10 Tf 10 100 Td (VISIBLE) Tj ET EMC",
+            "/Properties << /M 9 0 R >>",
+            vec![
+                b"<< /Type /OCG /Name (On) >>".to_vec(),
+                b"<< /Type /OCG /Name (Off) >>".to_vec(),
+                if use_not { b"<< /Type /OCMD /VE [/Not 8 0 R] >>".to_vec() } else { b"<< /Type /OCMD /OCGs [8 0 R] /P /AnyOff >>".to_vec() },
+            ],
+        );
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |d| {
+            d.set(
+                b"OCProperties".to_vec(),
+                Object::Dict(Dict::from_iter([
+                    (b"OCGs".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(7, 0)), Object::Ref(ObjRef::new(8, 0))])),
+                    (b"D".to_vec(), Object::Dict(Dict::from_iter([(b"OFF".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(8, 0))]))]))),
+                ])),
+            );
+        })
+        .unwrap();
+
+        remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+        let root = doc.root().unwrap();
+        let catalog = doc.get(root);
+        let oc = catalog.as_dict().and_then(|d| d.get(b"OCProperties")).map(|o| doc.resolve(o));
+        let default = oc.as_deref().and_then(|o| o.as_dict()).and_then(|d| d.get(b"D")).map(|o| doc.resolve(o));
+        let off = default.as_deref().and_then(|o| o.as_dict()).and_then(|d| d.get(b"OFF")).map(|o| doc.resolve(o));
+        assert!(
+            off.as_deref().and_then(Object::as_array).is_some_and(|a| a.iter().any(|o| o.as_ref() == Some(ObjRef::new(8, 0)))),
+            "off group lost for /VE Not={use_not}"
+        );
+        let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        assert!(pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("VISIBLE")));
+    }
+}
+
+#[test]
 fn hidden_ocmd_policy_matches_the_default_configuration() {
     use crate::sanitize::{Hidden, remove_hidden};
 
@@ -582,6 +692,10 @@ fn hidden_ocmd_policy_matches_the_default_configuration() {
         (Some("UnknownPolicy"), false, None, true),
         (None, true, None, true),
         (None, false, Some("and"), true),
+        (None, false, Some("and_single_not"), true),
+        (None, false, Some("and_single_off"), true),
+        (None, false, Some("or_single_on"), false),
+        (None, false, Some("or_single_off"), true),
         (Some("AllOn"), false, Some("not_off"), false),
         (None, false, Some("malformed_not"), true),
         (None, false, Some("malformed_without_ocgs"), true),
@@ -609,6 +723,13 @@ fn hidden_ocmd_policy_matches_the_default_configuration() {
         match visibility {
             Some("and") => membership
                 .set(b"VE".to_vec(), Object::Array(vec![Object::name("And"), Object::Ref(ObjRef::new(7, 0)), Object::Ref(ObjRef::new(8, 0))])),
+            Some("and_single_not") => membership.set(
+                b"VE".to_vec(),
+                Object::Array(vec![Object::name("Not"), Object::Array(vec![Object::name("And"), Object::Ref(ObjRef::new(7, 0))])]),
+            ),
+            Some("and_single_off") => membership.set(b"VE".to_vec(), Object::Array(vec![Object::name("And"), Object::Ref(ObjRef::new(8, 0))])),
+            Some("or_single_on") => membership.set(b"VE".to_vec(), Object::Array(vec![Object::name("Or"), Object::Ref(ObjRef::new(7, 0))])),
+            Some("or_single_off") => membership.set(b"VE".to_vec(), Object::Array(vec![Object::name("Or"), Object::Ref(ObjRef::new(8, 0))])),
             Some("not_off") => membership.set(b"VE".to_vec(), Object::Array(vec![Object::name("Not"), Object::Ref(ObjRef::new(8, 0))])),
             Some("malformed_not") => membership
                 .set(b"VE".to_vec(), Object::Array(vec![Object::name("Not"), Object::Ref(ObjRef::new(7, 0)), Object::Ref(ObjRef::new(8, 0))])),
