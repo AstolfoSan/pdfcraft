@@ -124,7 +124,8 @@ impl<'a> Scope<'a> {
         {
             return true;
         }
-        // A membership dictionary (default policy AnyOn): hidden when all its groups are.
+        // Evaluate the policy against the same default configuration used to select hidden
+        // groups. A membership dictionary's default policy is AnyOn.
         let d = doc.resolve(o);
         let Some(d) = d.as_dict() else { return false };
         if d.name(b"Type") != Some(b"OCMD") {
@@ -135,7 +136,113 @@ impl<'a> Scope<'a> {
             Some(_) => d.get(b"OCGs").and_then(Object::as_ref).into_iter().collect(),
             None => Vec::new(),
         };
-        !groups.is_empty() && groups.iter().all(|g| self.hidden_layers.contains(g))
+        let fail_closed = || groups.iter().any(|g| self.hidden_layers.contains(g));
+        if let Some(expression) = d.get(b"VE") {
+            let visible = self.visibility_expression(doc, expression, 0, &mut HashSet::new(), &mut 4096);
+            return !visible
+                .unwrap_or_else(|| !fail_closed() && !self.expression_mentions_hidden(doc, expression, 0, &mut HashSet::new(), &mut 4096));
+        }
+        if groups.is_empty() {
+            return false;
+        }
+        let any_on = groups.iter().any(|g| !self.hidden_layers.contains(g));
+        let all_on = groups.iter().all(|g| !self.hidden_layers.contains(g));
+        let policy = match d.get(b"P") {
+            None => b"AnyOn".as_slice(),
+            Some(Object::Name(name)) => name.as_slice(),
+            Some(_) => return fail_closed(),
+        };
+        match policy {
+            b"AnyOn" => !any_on,
+            b"AllOn" => !all_on,
+            b"AnyOff" => all_on,
+            b"AllOff" => any_on,
+            // An invalid policy must not make a candidate hidden block survive sanitization.
+            _ => fail_closed(),
+        }
+    }
+
+    /// Evaluate an optional-content visibility expression (`/VE`) against the default config.
+    /// Malformed, cyclic, or excessive expressions return `None` so the caller can fail closed.
+    fn visibility_expression(
+        &self,
+        doc: &Document,
+        expression: &Object,
+        depth: usize,
+        path: &mut HashSet<ObjRef>,
+        budget: &mut usize,
+    ) -> Option<bool> {
+        if depth > 64 || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let reference = expression.as_ref();
+        if let Some(r) = reference
+            && !path.insert(r)
+        {
+            return None;
+        }
+        let resolved = doc.resolve(expression);
+        let result = match &*resolved {
+            Object::Dict(d) if d.name(b"Type") == Some(b"OCG") => reference.map(|r| !self.hidden_layers.contains(&r)),
+            Object::Array(items) if (2..=4097).contains(&items.len()) => {
+                let operator = match items.first() {
+                    Some(Object::Name(n)) => n.as_slice(),
+                    _ => return None,
+                };
+                match operator {
+                    b"And" if items.len() >= 3 => {
+                        let mut visible = true;
+                        for item in items.iter().skip(1) {
+                            visible &= self.visibility_expression(doc, item, depth + 1, path, budget)?;
+                        }
+                        Some(visible)
+                    }
+                    b"Or" if items.len() >= 3 => {
+                        let mut visible = false;
+                        for item in items.iter().skip(1) {
+                            visible |= self.visibility_expression(doc, item, depth + 1, path, budget)?;
+                        }
+                        Some(visible)
+                    }
+                    b"Not" if items.len() == 2 => Some(!self.visibility_expression(doc, &items[1], depth + 1, path, budget)?),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = reference {
+            path.remove(&r);
+        }
+        result
+    }
+
+    /// Conservatively find hidden groups in an expression that could not be evaluated. Unknown
+    /// syntax, cycles, and exhausted budgets count as a possible hidden reference.
+    fn expression_mentions_hidden(&self, doc: &Document, expression: &Object, depth: usize, path: &mut HashSet<ObjRef>, budget: &mut usize) -> bool {
+        if depth > 64 || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        if let Some(r) = expression.as_ref() {
+            if self.hidden_layers.contains(&r) {
+                return true;
+            }
+            if !path.insert(r) {
+                return true;
+            }
+        }
+        let resolved = doc.resolve(expression);
+        let found = match &*resolved {
+            Object::Array(items) => items.iter().any(|item| self.expression_mentions_hidden(doc, item, depth + 1, path, budget)),
+            Object::Dict(d) if d.name(b"Type") == Some(b"OCG") => expression.as_ref().is_none_or(|r| self.hidden_layers.contains(&r)),
+            Object::Dict(_) => true,
+            _ => false,
+        };
+        if let Some(r) = expression.as_ref() {
+            path.remove(&r);
+        }
+        found
     }
 
     fn hits(&self, b: [f64; 4]) -> bool {
