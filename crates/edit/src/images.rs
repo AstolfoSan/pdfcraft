@@ -108,65 +108,729 @@ fn xobjects(doc: &Document, page: &Dict) -> Dict {
         .unwrap_or_default()
 }
 
-/// Whether a page resource name is used by the page or by a reachable Form that inherits the
-/// page's resources. A Form with its own `/Resources` has an independent namespace; forms without
-/// one inherit the caller's. On an unreadable or over-budget Form, preserve the resource.
-fn resource_used_by_inheriting_forms(doc: &Document, ops: &[Op], resources: &Dict, name: &[u8], budget: &mut usize) -> bool {
-    fn walk(
-        doc: &Document,
-        ops: &[Op],
-        resources: &Dict,
-        name: &[u8],
-        depth: usize,
-        budget: &mut usize,
-        path: &mut std::collections::HashSet<ObjRef>,
-    ) -> bool {
-        if depth > 32 || *budget == 0 {
-            return true;
+const IMAGE_CENSUS_MAX_OBJECTS: usize = 100_000;
+const IMAGE_CENSUS_MAX_BYTES: usize = 128 * 1024 * 1024;
+const IMAGE_CENSUS_MAX_OPERATORS: usize = 5_000_000;
+const IMAGE_CENSUS_MAX_VISITS: usize = 50_000;
+const IMAGE_CENSUS_MAX_DEPTH: usize = 64;
+const IMAGE_CENSUS_MAX_ALIASES: usize = 255;
+
+/// A full-document, bounded census of executable resource consumers. `incomplete` means a
+/// conservative cleanup cannot prove that an image is unused, so callers must leave its bytes.
+struct ImageUseCensus<'a> {
+    doc: &'a Document,
+    target: ObjRef,
+    used: bool,
+    incomplete: bool,
+    bytes: usize,
+    operators: usize,
+    visits: usize,
+}
+
+impl ImageUseCensus<'_> {
+    fn charge_visit(&mut self) -> bool {
+        self.visits = self.visits.saturating_add(1);
+        if self.visits > IMAGE_CENSUS_MAX_VISITS {
+            self.incomplete = true;
+            false
+        } else {
+            true
         }
-        let xo = resources.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()).unwrap_or_default();
-        for op in ops.iter().filter(|op| op.is("Do")) {
-            let Some(call_name) = op.name(0) else {
-                continue;
-            };
-            if call_name == name {
-                return true;
-            }
-            let Some(resource) = xo.get(call_name) else {
-                continue;
-            };
-            let resolved = doc.resolve(resource);
-            let Object::Stream(stream) = &*resolved else {
-                continue;
-            };
-            let Some(reference) = resource.as_ref() else {
-                if stream.dict.name(b"Subtype") == Some(b"Form") && !stream.dict.contains(b"Resources") {
-                    return true;
-                }
-                continue;
-            };
-            if stream.dict.name(b"Subtype") != Some(b"Form") || stream.dict.contains(b"Resources") {
-                continue;
-            }
-            if !path.insert(reference) {
-                return true;
-            }
-            *budget -= 1;
-            let decoded = match stream.decoded() {
-                Ok(decoded) => decoded,
-                Err(_) => return true,
-            };
-            let nested_ops = parse(&decoded).ops;
-            let used = walk(doc, &nested_ops, resources, name, depth + 1, budget, path);
-            path.remove(&reference);
-            if used {
-                return true;
-            }
-        }
-        false
     }
 
-    walk(doc, ops, resources, name, 0, budget, &mut std::collections::HashSet::new())
+    fn charge_stream(&mut self, stream: &pdfcraft_cos::Stream) -> Option<Vec<u8>> {
+        if !self.charge_visit() {
+            return None;
+        }
+        let data = match stream.decoded() {
+            Ok(data) => data,
+            Err(_) => {
+                self.incomplete = true;
+                return None;
+            }
+        };
+        self.bytes = self.bytes.saturating_add(data.len());
+        if self.bytes > IMAGE_CENSUS_MAX_BYTES {
+            self.incomplete = true;
+            return None;
+        }
+        Some(data)
+    }
+
+    fn walk_stream(&mut self, object: &Object, inherited: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if self.used || self.incomplete {
+            return;
+        }
+        if !self.charge_visit() {
+            return;
+        }
+        if depth > IMAGE_CENSUS_MAX_DEPTH {
+            self.incomplete = true;
+            return;
+        }
+        let reference = object.as_ref();
+        if reference == Some(self.target) {
+            self.used = true;
+            return;
+        }
+        if let Some(reference) = reference
+            && !path.insert(reference)
+        {
+            // A cycle could be rendered differently under an inherited resource scope.
+            self.incomplete = true;
+            return;
+        }
+        let resolved = self.doc.resolve(object);
+        let Object::Stream(stream) = &*resolved else {
+            self.incomplete = true;
+            return;
+        };
+
+        // Image masks and alternates are serialized image consumers even though they are not
+        // reached by a `Do` of their own.
+        if stream.dict.name(b"Subtype") == Some(b"Image") {
+            for key in [b"SMask".as_slice(), b"Mask".as_slice()] {
+                let Some(dependency) = stream.dict.get(key) else { continue };
+                if dependency.as_ref() == Some(self.target) {
+                    self.used = true;
+                    return;
+                }
+                match dependency {
+                    Object::Ref(_) => self.walk_stream(dependency, inherited, depth + 1, path),
+                    Object::Null => {}
+                    Object::Name(name) if key == b"SMask" && name == b"None" => {}
+                    Object::Array(values) if key == b"Mask" && values.iter().all(|value| value.as_ref().is_none()) => {}
+                    _ => self.incomplete = true,
+                }
+                if self.incomplete || self.used {
+                    return;
+                }
+            }
+            if let Some(alternates) = stream.dict.get(b"Alternates").map(|o| self.doc.resolve(o)) {
+                let Some(items) = alternates.as_array() else {
+                    self.incomplete = true;
+                    return;
+                };
+                for item in items {
+                    let item = self.doc.resolve(item);
+                    let Some(image) = item.as_dict().and_then(|d| d.get(b"Image")) else {
+                        self.incomplete = true;
+                        return;
+                    };
+                    if image.as_ref() == Some(self.target) {
+                        self.used = true;
+                        return;
+                    }
+                    self.walk_stream(image, inherited, depth + 1, path);
+                    if self.incomplete || self.used {
+                        return;
+                    }
+                }
+            }
+            if let Some(reference) = reference {
+                path.remove(&reference);
+            }
+            return;
+        }
+
+        let subtype = stream.dict.name(b"Subtype");
+        let pattern = stream.dict.int(b"PatternType") == Some(1);
+        if subtype != Some(b"Form") && !pattern {
+            self.incomplete = true;
+            if let Some(reference) = reference {
+                path.remove(&reference);
+            }
+            return;
+        }
+        let resources =
+            stream.dict.get(b"Resources").map(|r| self.doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_else(|| inherited.clone());
+        let Some(data) = self.charge_stream(stream) else {
+            if let Some(reference) = reference {
+                path.remove(&reference);
+            }
+            return;
+        };
+        self.walk_content(&data, &resources, depth + 1, path);
+        if let Some(reference) = reference {
+            path.remove(&reference);
+        }
+    }
+
+    fn walk_type3(&mut self, font: &Object, inherited: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if !self.charge_visit() {
+            return;
+        }
+        let resolved = self.doc.resolve(font);
+        let Some(dict) = resolved.as_dict() else {
+            self.incomplete = true;
+            return;
+        };
+        if dict.name(b"Subtype") != Some(b"Type3") {
+            return;
+        }
+        let resources = dict.get(b"Resources").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_else(|| inherited.clone());
+        let Some(charprocs) = dict.get(b"CharProcs").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()) else {
+            self.incomplete = true;
+            return;
+        };
+        for (_, charproc) in charprocs.iter() {
+            self.walk_charproc(charproc, &resources, depth + 1, path);
+            if self.used || self.incomplete {
+                return;
+            }
+        }
+    }
+
+    fn walk_charproc(&mut self, object: &Object, inherited: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if self.used || self.incomplete {
+            return;
+        }
+        if !self.charge_visit() {
+            return;
+        }
+        if depth > IMAGE_CENSUS_MAX_DEPTH {
+            self.incomplete = true;
+            return;
+        }
+        let reference = object.as_ref();
+        if reference.is_some_and(|r| !path.insert(r)) {
+            self.incomplete = true;
+            return;
+        }
+        let resolved = self.doc.resolve(object);
+        let Object::Stream(stream) = &*resolved else {
+            self.incomplete = true;
+            return;
+        };
+        let resources =
+            stream.dict.get(b"Resources").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_else(|| inherited.clone());
+        if let Some(data) = self.charge_stream(stream) {
+            self.walk_content(&data, &resources, depth + 1, path);
+        }
+        if let Some(reference) = reference {
+            path.remove(&reference);
+        }
+    }
+
+    fn walk_resources_for_operator(&mut self, op: &Op, resources: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if op.is("Tf") {
+            let Some(name) = op.name(0) else {
+                self.incomplete = true;
+                return;
+            };
+            if let Some(fonts) = resources.get(b"Font").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned())
+                && let Some(font) = fonts.get(name)
+            {
+                self.walk_type3(font, resources, depth + 1, path);
+            }
+        } else if op.is("gs") {
+            let Some(name) = op.name(0) else {
+                self.incomplete = true;
+                return;
+            };
+            let states = resources.get(b"ExtGState").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned());
+            let Some(state) = states.as_ref().and_then(|d| d.get(name)).map(|o| self.doc.resolve(o)) else {
+                self.incomplete = true;
+                return;
+            };
+            let Some(state_dict) = state.as_dict() else {
+                self.incomplete = true;
+                return;
+            };
+            if let Some(font_value) = state_dict.get(b"Font") {
+                let font = self.doc.resolve(font_value);
+                let Some(values) = font.as_array() else {
+                    self.incomplete = true;
+                    return;
+                };
+                if values.len() != 2 {
+                    self.incomplete = true;
+                    return;
+                }
+                self.walk_type3(&values[0], resources, depth + 1, path);
+                if self.incomplete || self.used {
+                    return;
+                }
+            }
+            let Some(mask_value) = state_dict.get(b"SMask") else { return };
+            let mask = self.doc.resolve(mask_value);
+            match &*mask {
+                Object::Name(name) if name == b"None" => {}
+                Object::Dict(mask_dict) => {
+                    let Some(group) = mask_dict.get(b"G") else {
+                        self.incomplete = true;
+                        return;
+                    };
+                    let resolved_group = self.doc.resolve(group);
+                    if !matches!(&*resolved_group, Object::Stream(stream) if stream.dict.name(b"Subtype") == Some(b"Form")) {
+                        self.incomplete = true;
+                        return;
+                    }
+                    self.walk_stream(group, resources, depth + 1, path);
+                }
+                _ => self.incomplete = true,
+            }
+        } else if op.is("scn") || op.is("SCN") {
+            let Some(name) = op.operands.last().and_then(Object::as_name) else { return };
+            let patterns = resources.get(b"Pattern").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned());
+            if let Some(pattern) = patterns.as_ref().and_then(|d| d.get(name)) {
+                let resolved = self.doc.resolve(pattern);
+                if resolved.as_dict().is_some_and(|d| d.int(b"PatternType") == Some(1)) {
+                    self.walk_stream(pattern, resources, depth + 1, path);
+                }
+            }
+        }
+    }
+
+    fn walk_content(&mut self, data: &[u8], resources: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        self.walk_parsed(parse(data), resources, depth, path);
+    }
+
+    fn walk_parsed(&mut self, parsed: pdfcraft_content::Parsed, resources: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if self.used || self.incomplete {
+            return;
+        }
+        if depth > IMAGE_CENSUS_MAX_DEPTH {
+            self.incomplete = true;
+            return;
+        }
+        self.operators = self.operators.saturating_add(parsed.ops.len());
+        if parsed.skipped != 0 || self.operators > IMAGE_CENSUS_MAX_OPERATORS {
+            self.incomplete = true;
+            return;
+        }
+        for op in &parsed.ops {
+            self.walk_resources_for_operator(op, resources, depth, path);
+            if self.incomplete || self.used {
+                return;
+            }
+            if !op.is("Do") {
+                continue;
+            }
+            let Some(name) = op.name(0) else {
+                self.incomplete = true;
+                return;
+            };
+            let Some(xobjects) = resources.get(b"XObject").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()) else {
+                self.incomplete = true;
+                return;
+            };
+            let Some(xobject) = xobjects.get(name) else {
+                self.incomplete = true;
+                return;
+            };
+            if xobject.as_ref() == Some(self.target) {
+                self.used = true;
+                return;
+            }
+            self.walk_stream(xobject, resources, depth + 1, path);
+            if self.incomplete || self.used {
+                return;
+            }
+        }
+    }
+
+    fn walk_appearances(&mut self, object: &Object, resources: &Dict, depth: usize, path: &mut std::collections::HashSet<ObjRef>) {
+        if self.used || self.incomplete {
+            return;
+        }
+        if !self.charge_visit() {
+            return;
+        }
+        if depth > IMAGE_CENSUS_MAX_DEPTH {
+            self.incomplete = true;
+            return;
+        }
+        let reference = object.as_ref();
+        match &*self.doc.resolve(object) {
+            Object::Stream(_) => self.walk_stream(object, resources, depth + 1, path),
+            Object::Dict(dict) => {
+                if let Some(reference) = reference
+                    && !path.insert(reference)
+                {
+                    self.incomplete = true;
+                    return;
+                }
+                if dict.contains(b"Resources") {
+                    self.incomplete = true;
+                    return;
+                }
+                for (_, value) in dict.iter() {
+                    self.walk_appearances(value, resources, depth + 1, path);
+                    if self.incomplete || self.used {
+                        return;
+                    }
+                }
+                if let Some(reference) = reference {
+                    path.remove(&reference);
+                }
+            }
+            Object::Array(values) => {
+                if let Some(reference) = reference
+                    && !path.insert(reference)
+                {
+                    self.incomplete = true;
+                    return;
+                }
+                for value in values {
+                    self.walk_appearances(value, resources, depth + 1, path);
+                    if self.incomplete || self.used {
+                        return;
+                    }
+                }
+                if let Some(reference) = reference {
+                    path.remove(&reference);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Remove a deleted/replaced image from every resource dictionary only after a bounded census
+/// proves no page, Form, Type3 glyph, soft mask, tiling pattern, or annotation appearance uses it.
+/// Any unsupported or malformed consumer preserves the image and still lets the edit succeed.
+fn prune_unused_image(doc: &mut Document, target: ObjRef) {
+    let object_count = doc.scan_objects_checked().take(IMAGE_CENSUS_MAX_OBJECTS + 1).count();
+    if object_count > IMAGE_CENSUS_MAX_OBJECTS {
+        return;
+    }
+    let mut census = ImageUseCensus { doc, target, used: false, incomplete: false, bytes: 0, operators: 0, visits: 0 };
+    let mut path = std::collections::HashSet::new();
+    let pages = pdfcraft_model::pages(doc);
+    if pages.len() > IMAGE_CENSUS_MAX_OBJECTS {
+        return;
+    }
+    for page in &pages {
+        let Some(resources) = page.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()) else {
+            census.incomplete = true;
+            break;
+        };
+        let contents_object = page.dict.get(b"Contents").map(|value| doc.resolve(value));
+        let contents: &[Object] = match contents_object.as_deref() {
+            None => &[],
+            Some(Object::Array(items)) => items,
+            Some(value) => std::slice::from_ref(value),
+        };
+        if contents.len() > IMAGE_CENSUS_MAX_VISITS {
+            census.incomplete = true;
+            break;
+        }
+        let mut content_data = Vec::with_capacity(contents.len());
+        for content in contents {
+            let resolved = doc.resolve(content);
+            let Object::Stream(stream) = &*resolved else {
+                census.incomplete = true;
+                break;
+            };
+            if let Some(data) = census.charge_stream(stream) {
+                content_data.push(data);
+            }
+            if census.incomplete {
+                break;
+            }
+        }
+        if !census.incomplete {
+            census.walk_parsed(Pieces::join(&content_data).parse(), &resources, 0, &mut path);
+        }
+        let annots = page.dict.get(b"Annots").map(|o| doc.resolve(o));
+        if let Some(annots) = annots {
+            let Some(items) = annots.as_array() else {
+                census.incomplete = true;
+                break;
+            };
+            if items.len() > IMAGE_CENSUS_MAX_OBJECTS {
+                census.incomplete = true;
+                break;
+            }
+            for item in items {
+                if !census.charge_visit() {
+                    break;
+                }
+                let resolved = doc.resolve(item);
+                let Some(ap) = resolved.as_dict().and_then(|d| d.get(b"AP")) else { continue };
+                census.walk_appearances(ap, &resources, 0, &mut path);
+                if census.incomplete || census.used {
+                    break;
+                }
+            }
+        }
+        if census.incomplete || census.used {
+            break;
+        }
+    }
+    if census.used || census.incomplete {
+        return;
+    }
+
+    // Unknown stream types carrying their own resource namespace could also consume XObjects.
+    let checked: Vec<_> = doc.scan_objects_checked().collect();
+    if checked.len() > IMAGE_CENSUS_MAX_OBJECTS || checked.iter().any(|(_, item)| item.is_err()) {
+        return;
+    }
+    if checked.iter().any(|(_, item)| {
+        item.as_ref().ok().is_some_and(|o| matches!(o.as_ref(), Object::Stream(s) if s.dict.contains(b"Resources") && s.dict.name(b"Subtype") != Some(b"Form") && s.dict.int(b"PatternType") != Some(1)))
+    }) {
+        return;
+    }
+
+    let mut staged = std::collections::HashMap::new();
+    let mut indirect_xobject_dicts = std::collections::HashSet::new();
+    let mut indirect_alternate_arrays = std::collections::HashSet::new();
+    let mut aliases = 0usize;
+    let mut mapping_visits = 0usize;
+    let mut dependency_visits = 0usize;
+    for (reference, item) in checked {
+        let Ok(object) = item else { return };
+        let mut object = (*object).clone();
+        let mappings_changed = match prune_xobject_mappings(&mut object, target, &mut indirect_xobject_dicts, &mut aliases, 0, &mut mapping_visits) {
+            Ok(changed) => changed,
+            Err(()) => return,
+        };
+        let dependencies_changed =
+            match prune_image_dependencies(&mut object, doc, target, &mut indirect_alternate_arrays, &mut aliases, 0, &mut dependency_visits) {
+                Ok(changed) => changed,
+                Err(()) => return,
+            };
+        if mappings_changed || dependencies_changed {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+                return;
+            }
+            staged.insert(reference, object);
+        }
+    }
+    for reference in indirect_xobject_dicts {
+        let was_staged = staged.contains_key(&reference);
+        let mut object = staged.remove(&reference).unwrap_or_else(|| (*doc.get(reference)).clone());
+        let changed = match remove_target_aliases(object.as_dict_mut(), target, &mut aliases) {
+            Ok(changed) => changed,
+            Err(()) => return,
+        };
+        if changed || was_staged {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+                return;
+            }
+            staged.insert(reference, object);
+        }
+    }
+    for reference in indirect_alternate_arrays {
+        let was_staged = staged.contains_key(&reference);
+        let mut object = staged.remove(&reference).unwrap_or_else(|| (*doc.get(reference)).clone());
+        let changed = match remove_target_alternate_entries(&mut object, doc, target, &mut aliases, &mut dependency_visits) {
+            Ok(changed) => changed,
+            Err(()) => return,
+        };
+        if changed {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+                return;
+            }
+            staged.insert(reference, object);
+        } else if !matches!(&object, Object::Array(_)) {
+            // An indirect `/Alternates` value that is not an array is malformed. Since the
+            // census cannot establish whether it retains the target, preserve the whole edit.
+            return;
+        } else if was_staged {
+            staged.insert(reference, object);
+        }
+    }
+    for (reference, object) in staged {
+        doc.set(reference, object);
+    }
+}
+
+fn remove_target_aliases(dict: Option<&mut Dict>, target: ObjRef, aliases: &mut usize) -> Result<bool, ()> {
+    let Some(dict) = dict else { return Ok(false) };
+    if dict.iter().take(IMAGE_CENSUS_MAX_VISITS + 1).count() > IMAGE_CENSUS_MAX_VISITS {
+        return Err(());
+    }
+    let mut names = Vec::new();
+    for (name, value) in dict.iter() {
+        if value.as_ref() == Some(target) {
+            if aliases.saturating_add(names.len()) >= IMAGE_CENSUS_MAX_ALIASES {
+                return Err(());
+            }
+            names.push(name.clone());
+        }
+    }
+    for name in &names {
+        dict.remove(name);
+    }
+    *aliases = aliases.saturating_add(names.len());
+    Ok(!names.is_empty())
+}
+
+fn prune_xobject_mappings(
+    object: &mut Object,
+    target: ObjRef,
+    indirect: &mut std::collections::HashSet<ObjRef>,
+    aliases: &mut usize,
+    depth: usize,
+    visits: &mut usize,
+) -> Result<bool, ()> {
+    charge_object_walk(depth, visits)?;
+    let mut changed = false;
+    match object {
+        Object::Array(values) => {
+            for value in values {
+                changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, visits)?;
+            }
+        }
+        Object::Dict(dict) | Object::Stream(pdfcraft_cos::Stream { dict, .. }) => {
+            if let Some(xobjects) = dict.get_mut(b"XObject") {
+                match xobjects {
+                    Object::Ref(reference) => {
+                        indirect.insert(*reference);
+                    }
+                    Object::Dict(mappings) => changed |= remove_target_aliases(Some(mappings), target, aliases)?,
+                    _ => {}
+                }
+            }
+            let mut keys = Vec::new();
+            for (key, _) in dict.iter() {
+                if keys.len() >= IMAGE_CENSUS_MAX_VISITS {
+                    return Err(());
+                }
+                keys.push(key.clone());
+            }
+            for key in keys {
+                if let Some(value) = dict.get_mut(&key) {
+                    changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, visits)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+fn contains_target_ref(object: &Object, target: ObjRef, depth: usize, visits: &mut usize) -> Result<bool, ()> {
+    charge_object_walk(depth, visits)?;
+    match object {
+        Object::Ref(reference) => Ok(*reference == target),
+        Object::Array(values) => {
+            for value in values {
+                if contains_target_ref(value, target, depth + 1, visits)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn alternate_uses_target(object: &Object, doc: &Document, target: ObjRef) -> bool {
+    doc.resolve(object).as_dict().and_then(|dict| dict.get(b"Image")).is_some_and(|image| image.as_ref() == Some(target))
+}
+
+fn remove_target_alternate_entries(object: &mut Object, doc: &Document, target: ObjRef, aliases: &mut usize, visits: &mut usize) -> Result<bool, ()> {
+    let Object::Array(entries) = object else { return Ok(false) };
+    let mut retained = Vec::new();
+    let mut removed = 0;
+    for entry in entries.iter() {
+        charge_object_walk(1, visits)?;
+        if alternate_uses_target(entry, doc, target) {
+            if aliases.saturating_add(removed) >= IMAGE_CENSUS_MAX_ALIASES {
+                return Err(());
+            }
+            removed += 1;
+        } else {
+            retained.push(entry.clone());
+        }
+    }
+    if removed != 0 {
+        *entries = retained;
+        *aliases = aliases.saturating_add(removed);
+    }
+    Ok(removed != 0)
+}
+
+/// Remove dependencies on an image only after the document census proves no active consumer
+/// uses it. The dependent image is left in place, but its stale optional mask/alternate edge is
+/// removed so full-save garbage collection can release the target bytes.
+fn prune_image_dependencies(
+    object: &mut Object,
+    doc: &Document,
+    target: ObjRef,
+    indirect_alternate_arrays: &mut std::collections::HashSet<ObjRef>,
+    aliases: &mut usize,
+    depth: usize,
+    visits: &mut usize,
+) -> Result<bool, ()> {
+    charge_object_walk(depth, visits)?;
+    let mut changed = false;
+    match object {
+        Object::Array(values) => {
+            for value in values {
+                changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, visits)?;
+            }
+        }
+        Object::Dict(dict) | Object::Stream(pdfcraft_cos::Stream { dict, .. }) => {
+            if dict.name(b"Subtype") == Some(b"Image") {
+                for key in [b"SMask".as_slice(), b"Mask".as_slice()] {
+                    let contains_target =
+                        if let Some(value) = dict.get(key) { contains_target_ref(value, target, depth + 1, visits)? } else { false };
+                    if contains_target {
+                        if aliases.saturating_add(1) > IMAGE_CENSUS_MAX_ALIASES {
+                            return Err(());
+                        }
+                        dict.remove(key);
+                        *aliases = aliases.saturating_add(1);
+                        changed = true;
+                    }
+                }
+                match dict.get(b"Alternates") {
+                    Some(Object::Array(_)) => {
+                        let Some(Object::Array(entries)) = dict.get_mut(b"Alternates") else { return Err(()) };
+                        let mut retained = Vec::new();
+                        let mut removed = 0;
+                        for entry in entries.iter() {
+                            charge_object_walk(depth + 1, visits)?;
+                            if alternate_uses_target(entry, doc, target) {
+                                if aliases.saturating_add(removed) >= IMAGE_CENSUS_MAX_ALIASES {
+                                    return Err(());
+                                }
+                                removed += 1;
+                            } else {
+                                retained.push(entry.clone());
+                            }
+                        }
+                        if removed != 0 {
+                            *entries = retained;
+                            *aliases = aliases.saturating_add(removed);
+                            changed = true;
+                        }
+                    }
+                    Some(Object::Ref(reference)) => {
+                        indirect_alternate_arrays.insert(*reference);
+                    }
+                    _ => {}
+                }
+            }
+            let mut keys = Vec::new();
+            for (key, _) in dict.iter() {
+                if keys.len() >= IMAGE_CENSUS_MAX_VISITS {
+                    return Err(());
+                }
+                keys.push(key.clone());
+            }
+            for key in keys {
+                if let Some(value) = dict.get_mut(&key) {
+                    changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, visits)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+fn charge_object_walk(depth: usize, visits: &mut usize) -> Result<(), ()> {
+    if depth > IMAGE_CENSUS_MAX_DEPTH {
+        return Err(());
+    }
+    *visits = visits.saturating_add(1);
+    if *visits > IMAGE_CENSUS_MAX_VISITS { Err(()) } else { Ok(()) }
 }
 
 fn intersection(a: [f64; 4], b: [f64; 4]) -> Option<[f64; 4]> {
@@ -522,8 +1186,8 @@ pub fn change_image(doc: &mut Document, page: usize, index: usize, change: &Imag
     if !ops.get(img.op).is_some_and(|op| op.is("Do")) {
         return Err(EditError::Invalid("the image operation is missing".into()));
     }
-    let old_name = ops.get(img.op).and_then(|op| op.name(0)).map(<[u8]>::to_vec);
     let old_object = img.object;
+    let prune_target = matches!(change, ImageChange::Delete | ImageChange::Replace(_)).then_some(old_object).flatten();
     let mut resources = None;
     let replacement: Vec<Op> = match change {
         ImageChange::Delete => Vec::new(),
@@ -549,47 +1213,6 @@ pub fn change_image(doc: &mut Document, page: usize, index: usize, change: &Imag
         }
     };
     let changed = crate::text::splice(&pieces, &ops, |index| if index == img.op { (replacement.clone(), false) } else { (Vec::new(), true) });
-    if let Some(old_name) = old_name.as_deref() {
-        let rewritten = Pieces::join(&changed.iter().map(Vec::as_slice).collect::<Vec<_>>());
-        let rewritten_ops = rewritten.parse().ops;
-        let current_resources = resources
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| p.dict.get(b"Resources").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()).unwrap_or_default());
-        let xo = current_resources.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()).unwrap_or_default();
-        let mut aliases = Vec::new();
-        for (resource_name, value) in xo.iter() {
-            let matches_object = old_object.is_some() && value.as_ref() == old_object;
-            if matches_object || resource_name.as_slice() == old_name {
-                if aliases.len() >= 256 {
-                    return Err(EditError::Invalid("the image has too many resource aliases to update safely".into()));
-                }
-                aliases.push(resource_name.clone());
-            }
-        }
-        if aliases.is_empty() {
-            aliases.push(old_name.to_vec());
-        }
-        let mut unused = Vec::new();
-        let mut form_scan_budget = 4096;
-        for resource_name in aliases {
-            let used_on_page = rewritten_ops.iter().any(|op| op.is("Do") && op.name(0) == Some(resource_name.as_slice()));
-            let used_in_form =
-                !used_on_page && resource_used_by_inheriting_forms(doc, &rewritten_ops, &current_resources, &resource_name, &mut form_scan_budget);
-            if !used_on_page && !used_in_form {
-                unused.push(resource_name);
-            }
-        }
-        if !unused.is_empty() {
-            let mut res = resources.take().unwrap_or(current_resources);
-            let mut xo = res.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()).unwrap_or_default();
-            for resource_name in &unused {
-                xo.remove(resource_name);
-            }
-            res.set(b"XObject".to_vec(), Object::Dict(xo));
-            resources = Some(res);
-        }
-    }
     let contents = crate::text::rewritten_contents(doc, &all, changed);
     doc.update_dict(p.obj, |d| {
         d.set(b"Contents".to_vec(), contents);
@@ -597,6 +1220,9 @@ pub fn change_image(doc: &mut Document, page: usize, index: usize, change: &Imag
             d.set(b"Resources".to_vec(), Object::Dict(res));
         }
     })?;
+    if let Some(target) = prune_target {
+        prune_unused_image(doc, target);
+    }
     Ok(())
 }
 
