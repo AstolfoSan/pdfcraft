@@ -114,6 +114,38 @@ const IMAGE_CENSUS_MAX_OPERATORS: usize = 5_000_000;
 const IMAGE_CENSUS_MAX_VISITS: usize = 50_000;
 const IMAGE_CENSUS_MAX_DEPTH: usize = 64;
 const IMAGE_CENSUS_MAX_ALIASES: usize = 255;
+const IMAGE_REWRITE_MAX_ENTRIES: usize = 500_000;
+const IMAGE_REWRITE_MAX_CONTAINER_ENTRIES: usize = 100_000;
+const IMAGE_REWRITE_MAX_KEY_BYTES: usize = 16 * 1024 * 1024;
+const IMAGE_REWRITE_MAX_STAGED_OBJECTS: usize = IMAGE_CENSUS_MAX_ALIASES;
+
+/// Separate budget for the conservative cleanup rewrite walk. It counts every array item and
+/// dictionary entry inspected, including primitive values, without recursively visiting scalar
+/// leaves. This work is distinct from the executable-content census budget above.
+#[derive(Default)]
+struct ImageRewriteBudget {
+    entries: usize,
+    key_bytes: usize,
+}
+
+impl ImageRewriteBudget {
+    fn charge_entries(&mut self, count: usize) -> Result<(), ()> {
+        if count > IMAGE_REWRITE_MAX_CONTAINER_ENTRIES {
+            return Err(());
+        }
+        self.entries = self.entries.saturating_add(count);
+        if self.entries > IMAGE_REWRITE_MAX_ENTRIES { Err(()) } else { Ok(()) }
+    }
+
+    fn charge_dict(&mut self, dict: &Dict) -> Result<(), ()> {
+        self.charge_entries(dict.len())
+    }
+
+    fn charge_key_bytes(&mut self, count: usize) -> Result<(), ()> {
+        self.key_bytes = self.key_bytes.saturating_add(count);
+        if self.key_bytes > IMAGE_REWRITE_MAX_KEY_BYTES { Err(()) } else { Ok(()) }
+    }
+}
 
 /// A full-document, bounded census of executable resource consumers. `incomplete` means a
 /// conservative cleanup cannot prove that an image is unused, so callers must leave its bytes.
@@ -502,9 +534,16 @@ fn prune_unused_image(doc: &mut Document, target: ObjRef) {
         return;
     }
     for page in &pages {
-        let Some(resources) = page.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()) else {
-            census.incomplete = true;
-            break;
+        let resources = match page.dict.get(b"Resources") {
+            None => Dict::new(),
+            Some(value) => {
+                let resolved = doc.resolve(value);
+                let Some(resources) = resolved.as_dict().cloned() else {
+                    census.incomplete = true;
+                    break;
+                };
+                resources
+            }
         };
         let contents_object = page.dict.get(b"Contents").map(|value| doc.resolve(value));
         let contents: &[Object] = match contents_object.as_deref() {
@@ -578,22 +617,21 @@ fn prune_unused_image(doc: &mut Document, target: ObjRef) {
     let mut indirect_xobject_dicts = std::collections::HashSet::new();
     let mut indirect_alternate_arrays = std::collections::HashSet::new();
     let mut aliases = 0usize;
-    let mut mapping_visits = 0usize;
-    let mut dependency_visits = 0usize;
+    let mut rewrite_budget = ImageRewriteBudget::default();
     for (reference, item) in checked {
         let Ok(object) = item else { return };
         let mut object = (*object).clone();
-        let mappings_changed = match prune_xobject_mappings(&mut object, target, &mut indirect_xobject_dicts, &mut aliases, 0, &mut mapping_visits) {
+        let mappings_changed = match prune_xobject_mappings(&mut object, target, &mut indirect_xobject_dicts, &mut aliases, 0, &mut rewrite_budget) {
             Ok(changed) => changed,
             Err(()) => return,
         };
         let dependencies_changed =
-            match prune_image_dependencies(&mut object, doc, target, &mut indirect_alternate_arrays, &mut aliases, 0, &mut dependency_visits) {
+            match prune_image_dependencies(&mut object, doc, target, &mut indirect_alternate_arrays, &mut aliases, 0, &mut rewrite_budget) {
                 Ok(changed) => changed,
                 Err(()) => return,
             };
         if mappings_changed || dependencies_changed {
-            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES || staged.len() >= IMAGE_REWRITE_MAX_STAGED_OBJECTS {
                 return;
             }
             staged.insert(reference, object);
@@ -602,12 +640,12 @@ fn prune_unused_image(doc: &mut Document, target: ObjRef) {
     for reference in indirect_xobject_dicts {
         let was_staged = staged.contains_key(&reference);
         let mut object = staged.remove(&reference).unwrap_or_else(|| (*doc.get(reference)).clone());
-        let changed = match remove_target_aliases(object.as_dict_mut(), target, &mut aliases) {
+        let changed = match remove_target_aliases(object.as_dict_mut(), target, &mut aliases, &mut rewrite_budget) {
             Ok(changed) => changed,
             Err(()) => return,
         };
         if changed || was_staged {
-            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES || (!was_staged && staged.len() >= IMAGE_REWRITE_MAX_STAGED_OBJECTS) {
                 return;
             }
             staged.insert(reference, object);
@@ -616,12 +654,12 @@ fn prune_unused_image(doc: &mut Document, target: ObjRef) {
     for reference in indirect_alternate_arrays {
         let was_staged = staged.contains_key(&reference);
         let mut object = staged.remove(&reference).unwrap_or_else(|| (*doc.get(reference)).clone());
-        let changed = match remove_target_alternate_entries(&mut object, doc, target, &mut aliases, &mut dependency_visits) {
+        let changed = match remove_target_alternate_entries(&mut object, doc, target, &mut aliases, &mut rewrite_budget) {
             Ok(changed) => changed,
             Err(()) => return,
         };
         if changed {
-            if aliases > IMAGE_CENSUS_MAX_ALIASES {
+            if aliases > IMAGE_CENSUS_MAX_ALIASES || (!was_staged && staged.len() >= IMAGE_REWRITE_MAX_STAGED_OBJECTS) {
                 return;
             }
             staged.insert(reference, object);
@@ -638,13 +676,12 @@ fn prune_unused_image(doc: &mut Document, target: ObjRef) {
     }
 }
 
-fn remove_target_aliases(dict: Option<&mut Dict>, target: ObjRef, aliases: &mut usize) -> Result<bool, ()> {
+fn remove_target_aliases(dict: Option<&mut Dict>, target: ObjRef, aliases: &mut usize, budget: &mut ImageRewriteBudget) -> Result<bool, ()> {
     let Some(dict) = dict else { return Ok(false) };
-    if dict.iter().take(IMAGE_CENSUS_MAX_VISITS + 1).count() > IMAGE_CENSUS_MAX_VISITS {
-        return Err(());
-    }
+    budget.charge_dict(dict)?;
     let mut names = Vec::new();
     for (name, value) in dict.iter() {
+        budget.charge_key_bytes(name.len())?;
         if value.as_ref() == Some(target) {
             if aliases.saturating_add(names.len()) >= IMAGE_CENSUS_MAX_ALIASES {
                 return Err(());
@@ -665,14 +702,17 @@ fn prune_xobject_mappings(
     indirect: &mut std::collections::HashSet<ObjRef>,
     aliases: &mut usize,
     depth: usize,
-    visits: &mut usize,
+    budget: &mut ImageRewriteBudget,
 ) -> Result<bool, ()> {
-    charge_object_walk(depth, visits)?;
+    if depth > IMAGE_CENSUS_MAX_DEPTH {
+        return Err(());
+    }
     let mut changed = false;
     match object {
         Object::Array(values) => {
-            for value in values {
-                changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, visits)?;
+            budget.charge_entries(values.len())?;
+            for value in values.iter_mut().filter(|value| is_container(value)) {
+                changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, budget)?;
             }
         }
         Object::Dict(dict) | Object::Stream(pdfcraft_cos::Stream { dict, .. }) => {
@@ -681,20 +721,21 @@ fn prune_xobject_mappings(
                     Object::Ref(reference) => {
                         indirect.insert(*reference);
                     }
-                    Object::Dict(mappings) => changed |= remove_target_aliases(Some(mappings), target, aliases)?,
+                    Object::Dict(mappings) => changed |= remove_target_aliases(Some(mappings), target, aliases, budget)?,
                     _ => {}
                 }
             }
             let mut keys = Vec::new();
-            for (key, _) in dict.iter() {
-                if keys.len() >= IMAGE_CENSUS_MAX_VISITS {
-                    return Err(());
+            budget.charge_dict(dict)?;
+            for (key, value) in dict.iter() {
+                budget.charge_key_bytes(key.len())?;
+                if is_container(value) {
+                    keys.push(key.clone());
                 }
-                keys.push(key.clone());
             }
             for key in keys {
                 if let Some(value) = dict.get_mut(&key) {
-                    changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, visits)?;
+                    changed |= prune_xobject_mappings(value, target, indirect, aliases, depth + 1, budget)?;
                 }
             }
         }
@@ -703,13 +744,16 @@ fn prune_xobject_mappings(
     Ok(changed)
 }
 
-fn contains_target_ref(object: &Object, target: ObjRef, depth: usize, visits: &mut usize) -> Result<bool, ()> {
-    charge_object_walk(depth, visits)?;
+fn contains_target_ref(object: &Object, target: ObjRef, depth: usize, budget: &mut ImageRewriteBudget) -> Result<bool, ()> {
+    if depth > IMAGE_CENSUS_MAX_DEPTH {
+        return Err(());
+    }
     match object {
         Object::Ref(reference) => Ok(*reference == target),
         Object::Array(values) => {
-            for value in values {
-                if contains_target_ref(value, target, depth + 1, visits)? {
+            budget.charge_entries(values.len())?;
+            for value in values.iter().filter(|value| matches!(value, Object::Array(_))) {
+                if contains_target_ref(value, target, depth + 1, budget)? {
                     return Ok(true);
                 }
             }
@@ -723,12 +767,18 @@ fn alternate_uses_target(object: &Object, doc: &Document, target: ObjRef) -> boo
     doc.resolve(object).as_dict().and_then(|dict| dict.get(b"Image")).is_some_and(|image| image.as_ref() == Some(target))
 }
 
-fn remove_target_alternate_entries(object: &mut Object, doc: &Document, target: ObjRef, aliases: &mut usize, visits: &mut usize) -> Result<bool, ()> {
+fn remove_target_alternate_entries(
+    object: &mut Object,
+    doc: &Document,
+    target: ObjRef,
+    aliases: &mut usize,
+    budget: &mut ImageRewriteBudget,
+) -> Result<bool, ()> {
     let Object::Array(entries) = object else { return Ok(false) };
+    budget.charge_entries(entries.len())?;
     let mut retained = Vec::new();
     let mut removed = 0;
     for entry in entries.iter() {
-        charge_object_walk(1, visits)?;
         if alternate_uses_target(entry, doc, target) {
             if aliases.saturating_add(removed) >= IMAGE_CENSUS_MAX_ALIASES {
                 return Err(());
@@ -755,21 +805,24 @@ fn prune_image_dependencies(
     indirect_alternate_arrays: &mut std::collections::HashSet<ObjRef>,
     aliases: &mut usize,
     depth: usize,
-    visits: &mut usize,
+    budget: &mut ImageRewriteBudget,
 ) -> Result<bool, ()> {
-    charge_object_walk(depth, visits)?;
+    if depth > IMAGE_CENSUS_MAX_DEPTH {
+        return Err(());
+    }
     let mut changed = false;
     match object {
         Object::Array(values) => {
-            for value in values {
-                changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, visits)?;
+            budget.charge_entries(values.len())?;
+            for value in values.iter_mut().filter(|value| is_container(value)) {
+                changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, budget)?;
             }
         }
         Object::Dict(dict) | Object::Stream(pdfcraft_cos::Stream { dict, .. }) => {
             if dict.name(b"Subtype") == Some(b"Image") {
                 for key in [b"SMask".as_slice(), b"Mask".as_slice()] {
                     let contains_target =
-                        if let Some(value) = dict.get(key) { contains_target_ref(value, target, depth + 1, visits)? } else { false };
+                        if let Some(value) = dict.get(key) { contains_target_ref(value, target, depth + 1, budget)? } else { false };
                     if contains_target {
                         if aliases.saturating_add(1) > IMAGE_CENSUS_MAX_ALIASES {
                             return Err(());
@@ -782,10 +835,10 @@ fn prune_image_dependencies(
                 match dict.get(b"Alternates") {
                     Some(Object::Array(_)) => {
                         let Some(Object::Array(entries)) = dict.get_mut(b"Alternates") else { return Err(()) };
+                        budget.charge_entries(entries.len())?;
                         let mut retained = Vec::new();
                         let mut removed = 0;
                         for entry in entries.iter() {
-                            charge_object_walk(depth + 1, visits)?;
                             if alternate_uses_target(entry, doc, target) {
                                 if aliases.saturating_add(removed) >= IMAGE_CENSUS_MAX_ALIASES {
                                     return Err(());
@@ -808,15 +861,16 @@ fn prune_image_dependencies(
                 }
             }
             let mut keys = Vec::new();
-            for (key, _) in dict.iter() {
-                if keys.len() >= IMAGE_CENSUS_MAX_VISITS {
-                    return Err(());
+            budget.charge_dict(dict)?;
+            for (key, value) in dict.iter() {
+                budget.charge_key_bytes(key.len())?;
+                if is_container(value) {
+                    keys.push(key.clone());
                 }
-                keys.push(key.clone());
             }
             for key in keys {
                 if let Some(value) = dict.get_mut(&key) {
-                    changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, visits)?;
+                    changed |= prune_image_dependencies(value, doc, target, indirect_alternate_arrays, aliases, depth + 1, budget)?;
                 }
             }
         }
@@ -825,12 +879,8 @@ fn prune_image_dependencies(
     Ok(changed)
 }
 
-fn charge_object_walk(depth: usize, visits: &mut usize) -> Result<(), ()> {
-    if depth > IMAGE_CENSUS_MAX_DEPTH {
-        return Err(());
-    }
-    *visits = visits.saturating_add(1);
-    if *visits > IMAGE_CENSUS_MAX_VISITS { Err(()) } else { Ok(()) }
+fn is_container(object: &Object) -> bool {
+    matches!(object, Object::Array(_) | Object::Dict(_) | Object::Stream(_))
 }
 
 fn intersection(a: [f64; 4], b: [f64; 4]) -> Option<[f64; 4]> {

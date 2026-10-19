@@ -2252,6 +2252,62 @@ fn set_image_content(doc: &mut Document, page: usize, pieces: &[&[u8]]) {
     doc.update_dict(page, |d| d.set(b"Contents".to_vec(), Object::Array(contents))).unwrap();
 }
 
+fn add_blank_page(doc: &mut Document, resources: Option<Object>) {
+    let mut page = Dict::from_iter([
+        (b"Type".to_vec(), Object::name("Page")),
+        (b"Parent".to_vec(), Object::Ref(pdfcraft_cos::ObjRef::new(2, 0))),
+        (b"MediaBox".to_vec(), Object::Array([0, 0, 600, 800].map(Object::Int).to_vec())),
+    ]);
+    if let Some(resources) = resources {
+        page.set(b"Resources".to_vec(), resources);
+    }
+    let added = doc.add(Object::Dict(page));
+    doc.update_dict(pdfcraft_cos::ObjRef::new(2, 0), |d| {
+        d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(pdfcraft_cos::ObjRef::new(3, 0)), Object::Ref(added)]));
+        d.set(b"Count".to_vec(), Object::Int(2));
+    })
+    .unwrap();
+}
+
+fn image_pruning_fixture(blank_resources: Option<Option<Object>>, font_count: usize, private: &[u8]) -> Document {
+    let mut doc = image_page();
+    let target = images::page_images(&doc, 0).unwrap()[0].object.unwrap();
+    doc.set(target, Object::Stream(identifiable_test_image(private)));
+    if let Some(resources) = blank_resources {
+        add_blank_page(&mut doc, resources);
+    }
+    if font_count > 0 {
+        let mut fonts = doc
+            .get(pdfcraft_model::pages(&doc)[0].obj)
+            .as_dict()
+            .and_then(|d| d.get(b"Resources"))
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"Font"))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        for index in 0..font_count {
+            let font = doc.add(Object::Dict(Dict::from_iter([
+                (b"Type".to_vec(), Object::name("Font")),
+                (b"Subtype".to_vec(), Object::name("Type1")),
+                (b"BaseFont".to_vec(), Object::name("Helvetica")),
+                (b"FirstChar".to_vec(), Object::Int(32)),
+                (b"LastChar".to_vec(), Object::Int(255)),
+                (b"Widths".to_vec(), Object::Array(vec![Object::Int(500); 224])),
+            ])));
+            fonts.set(format!("ReviewFont{index}").into_bytes(), Object::Ref(font));
+        }
+        let page = pdfcraft_model::pages(&doc)[0].obj;
+        doc.update_dict(page, |d| {
+            let mut resources = d.get(b"Resources").and_then(Object::as_dict).cloned().unwrap_or_default();
+            resources.set(b"Font".to_vec(), Object::Dict(fonts));
+            d.set(b"Resources".to_vec(), Object::Dict(resources));
+        })
+        .unwrap();
+    }
+    doc
+}
+
 #[test]
 fn deleted_image_is_kept_when_reachable_through_each_non_page_consumer() {
     const PRIVATE: &[u8] = b"PRIVATE_CONTEXT_IMAGE";
@@ -2580,6 +2636,79 @@ fn deleting_image_prunes_unused_shared_resources_across_all_pages() {
     let saved = Document::open(Arc::new(bytes)).unwrap();
     assert!(xobject(&saved, 0, b"Im0").is_none());
     assert!(xobject(&saved, 1, b"Im0").is_none());
+}
+
+#[test]
+fn image_payload_pruning_handles_missing_resources_and_wide_scalar_arrays() {
+    const PRIVATE: &[u8] = b"PRIVATE_REVIEW_DELETED_IMAGE_PAYLOAD";
+    for (resources, font_count) in [(Some(None), 0), (Some(Some(Object::Dict(Dict::new()))), 0), (None, 225)] {
+        for replace in [false, true] {
+            let mut source = image_pruning_fixture(resources.clone(), font_count, PRIVATE);
+            let input = write_full(&source, &SaveOptions::default()).unwrap();
+            assert!(input.windows(PRIVATE.len()).any(|window| window == PRIVATE), "fixture lacked payload before editing");
+            source = Document::open(Arc::new(input)).unwrap();
+            let change = if replace {
+                images::ImageChange::Replace(source.add(Object::Stream(identifiable_test_image(b"PUBLIC_REPLACEMENT"))))
+            } else {
+                images::ImageChange::Delete
+            };
+            images::change_image(&mut source, 0, 0, &change).unwrap();
+
+            let output = write_full(&source, &SaveOptions::default()).unwrap();
+            let reopened = Document::open(Arc::new(output.clone())).unwrap();
+            assert!(!output.windows(PRIVATE.len()).any(|window| window == PRIVATE), "replace={replace}, resources={resources:?}, fonts={font_count}");
+            assert_eq!(images::page_images(&reopened, 0).unwrap().len(), usize::from(replace));
+        }
+    }
+}
+
+#[test]
+fn malformed_present_page_resources_keep_image_payload() {
+    const PRIVATE: &[u8] = b"PRIVATE_MALFORMED_RESOURCES_IMAGE";
+    let mut source = image_pruning_fixture(None, 0, PRIVATE);
+    add_blank_page(&mut source, Some(Object::Int(7)));
+    let input = write_full(&source, &SaveOptions::default()).unwrap();
+    assert!(input.windows(PRIVATE.len()).any(|window| window == PRIVATE), "fixture lacked payload before editing");
+    let mut source = Document::open(Arc::new(input)).unwrap();
+
+    images::change_image(&mut source, 0, 0, &images::ImageChange::Delete).unwrap();
+    let output = write_full(&source, &SaveOptions::default()).unwrap();
+    assert!(output.windows(PRIVATE.len()).any(|window| window == PRIVATE), "malformed present Resources unexpectedly allowed pruning");
+}
+
+#[test]
+fn rewrite_entry_budget_failure_keeps_earlier_staged_image_mappings() {
+    const PRIVATE: &[u8] = b"PRIVATE_REWRITE_BUDGET_IMAGE";
+    const OVERSIZED_CONTAINER: usize = 100_001;
+    let mut source = image_pruning_fixture(None, 0, PRIVATE);
+    let form = source.add(Object::Stream(Stream::flate(
+        Dict::from_iter([
+            (b"Subtype".to_vec(), Object::name("Form")),
+            (b"BBox".to_vec(), Object::Array([0, 0, 10, 10].map(Object::Int).to_vec())),
+            (b"Probe".to_vec(), Object::Array(vec![Object::Int(0); OVERSIZED_CONTAINER])),
+        ]),
+        b"",
+    )));
+    let page = pdfcraft_model::pages(&source)[0].obj;
+    source
+        .update_dict(page, |d| {
+            let mut resources = d.get(b"Resources").and_then(Object::as_dict).cloned().unwrap();
+            let mut xobjects = resources.get(b"XObject").and_then(Object::as_dict).cloned().unwrap();
+            xobjects.set(b"F".to_vec(), Object::Ref(form));
+            resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
+            d.set(b"Resources".to_vec(), Object::Dict(resources));
+        })
+        .unwrap();
+    set_image_content(&mut source, 0, &[b"q 200 0 0 100 100 100 cm /Im0 Do Q /F Do"]);
+    let input = write_full(&source, &SaveOptions::default()).unwrap();
+    assert!(input.windows(PRIVATE.len()).any(|window| window == PRIVATE), "fixture lacked payload before editing");
+    let mut source = Document::open(Arc::new(input)).unwrap();
+
+    images::change_image(&mut source, 0, 0, &images::ImageChange::Delete).unwrap();
+    let output = write_full(&source, &SaveOptions::default()).unwrap();
+    let reopened = Document::open(Arc::new(output.clone())).unwrap();
+    assert!(output.windows(PRIVATE.len()).any(|window| window == PRIVATE), "rewrite budget failure pruned image payload");
+    assert!(xobject(&reopened, 0, b"Im0").is_some(), "partial staging removed the page's image alias");
 }
 
 #[test]
