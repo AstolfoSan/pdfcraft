@@ -715,6 +715,41 @@ fn undecodable_form_is_counted_and_removed_by_hidden_layer_sanitization() {
 }
 
 #[test]
+fn form_chain_at_max_depth_is_counted_and_removed_by_hidden_layer_sanitization() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+
+    const PRIVATE: &[u8] = b"PRIVATE_FORM_BEYOND_MAX_DEPTH";
+    // MAX_DEPTH is 12. The final Form is encountered at that depth and is removed
+    // conservatively without being entered. Verify must count that removal or sanitize
+    // can skip the HiddenLayers pass entirely.
+    let mut forms = Vec::new();
+    for depth in 0..=12 {
+        let content = if depth == 12 {
+            b"BT /F1 10 Tf 10 100 Td (PRIVATE_FORM_BEYOND_MAX_DEPTH) Tj ET".to_vec()
+        } else {
+            format!("/F{} Do", depth + 1).into_bytes()
+        };
+        forms.push(stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", &content));
+    }
+    let xobjects = (0..=12).map(|depth| format!("/F{depth} {} 0 R", 7 + depth)).collect::<Vec<_>>().join(" ");
+    let mut doc = one_page(b"/F0 Do", &format!("/XObject << {xobjects} >>"), forms);
+    assert!(
+        write_full(&doc, &SaveOptions::default()).unwrap().windows(PRIVATE.len()).any(|w| w == PRIVATE),
+        "fixture lacked nested payload before sanitization"
+    );
+
+    let counts = scan(&doc);
+    assert!(counts.iter().any(|(hidden, count)| *hidden == Hidden::HiddenLayers && *count > 0), "depth-limited Form was not counted: {counts:?}");
+    let removed = remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+    assert!(
+        removed.iter().any(|(hidden, count)| *hidden == Hidden::HiddenLayers && *count > 0),
+        "depth-limited Form was not reported removed: {removed:?}"
+    );
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    assert!(!bytes.windows(PRIVATE.len()).any(|w| w == PRIVATE), "depth-limited Form payload remains in full save");
+}
+
+#[test]
 fn hidden_ocmd_resolves_an_indirect_policy_name() {
     use crate::sanitize::{Hidden, remove_hidden};
 
