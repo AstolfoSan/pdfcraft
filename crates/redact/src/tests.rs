@@ -607,6 +607,113 @@ fn hidden_ve_not_is_sanitized_when_its_group_is_on() {
     assert!(!pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("SECRET")));
 }
 
+fn all_on_ocmd_xobject(subtype: &str, policy: &str) -> Document {
+    let membership = match policy {
+        "AllOff" => "<< /Type /OCMD /OCGs [7 0 R] /P /AllOff >>",
+        "Not" => "<< /Type /OCMD /VE [/Not 7 0 R] >>",
+        _ => "<< /Type /OCMD /OCGs [7 0 R] /P /AllOff >>",
+    };
+    let (object_number, oc) = if policy == "DirectAllOff" { (8, membership) } else { (9, "8 0 R") };
+    let xobject = match subtype {
+        "Image" => stream(
+            &format!("/Type /XObject /Subtype /Image /Width 4 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /OC {oc}"),
+            b"PRIVATE_HIDDEN_XOBJECT_IMAGE",
+        ),
+        _ => stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 5 0 R >> >> /OC {oc}"),
+            b"BT /F1 10 Tf 10 100 Td (PRIVATE_HIDDEN_XOBJECT_FORM) Tj ET",
+        ),
+    };
+    let mut extras = vec![b"<< /Type /OCG /Name (On) >>".to_vec()];
+    if object_number == 9 {
+        extras.push(membership.as_bytes().to_vec());
+    }
+    extras.push(xobject);
+    let mut doc = one_page(b"/X Do", &format!("/XObject << /X {object_number} 0 R >>"), extras);
+    let root = doc.root().unwrap();
+    doc.update_dict(root, |d| {
+        d.set(
+            b"OCProperties".to_vec(),
+            Object::Dict(Dict::from_iter([
+                (b"OCGs".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(7, 0))])),
+                (b"D".to_vec(), Object::Dict(Dict::from_iter([(b"BaseState".to_vec(), Object::name("ON"))]))),
+            ])),
+        );
+    })
+    .unwrap();
+    doc
+}
+
+#[test]
+fn hidden_all_on_ocmd_image_and_form_xobjects_are_counted_and_removed() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+
+    let mut failures = Vec::new();
+    for subtype in ["Image", "Form"] {
+        for policy in ["AllOff", "Not"] {
+            let mut doc = all_on_ocmd_xobject(subtype, policy);
+            let before = scan(&doc);
+            let hidden_count = before.iter().find(|(h, _)| *h == Hidden::HiddenLayers).map_or(0, |(_, n)| *n);
+            if hidden_count == 0 {
+                failures.push(format!("{subtype} /{policy} was not counted: {before:?}"));
+            }
+
+            match remove_hidden(&mut doc, &[Hidden::HiddenLayers]) {
+                Ok(removed) if removed.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0) => {}
+                Ok(removed) => failures.push(format!("{subtype} /{policy} remove report is empty: {removed:?}")),
+                Err(error) => failures.push(format!("{subtype} /{policy} remove failed: {error}")),
+            }
+            let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+            if bytes.windows(b"PRIVATE_HIDDEN_XOBJECT_IMAGE".len()).any(|w| w == b"PRIVATE_HIDDEN_XOBJECT_IMAGE") {
+                failures.push(format!("{subtype} /{policy} image payload remains in full save"));
+            }
+            if bytes.windows(b"PRIVATE_HIDDEN_XOBJECT_FORM".len()).any(|w| w == b"PRIVATE_HIDDEN_XOBJECT_FORM") {
+                failures.push(format!("{subtype} /{policy} Form payload remains in full save"));
+            }
+            let saved = Document::open(Arc::new(bytes)).unwrap();
+            if pdfcraft_edit::text_lines(&saved, 0).unwrap().iter().any(|line| line.text.contains("PRIVATE_HIDDEN_XOBJECT_FORM")) {
+                failures.push(format!("{subtype} /{policy} Form text remains extractable"));
+            }
+            if !pdfcraft_edit::page_images(&saved, 0).unwrap().is_empty() {
+                failures.push(format!("{subtype} /{policy} image remains on the page"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn repeated_image_with_direct_alloff_membership_is_counted_per_draw() {
+    use crate::sanitize::{Hidden, scan};
+
+    let mut doc = all_on_ocmd_xobject("Image", "DirectAllOff");
+    let page = pdfcraft_model::pages(&doc)[0].obj;
+    let contents = doc.add(Object::Stream(pdfcraft_cos::Stream::flate(Dict::new(), b"/X Do /X Do /X Do")));
+    doc.update_dict(page, |d| d.set(b"Contents".to_vec(), Object::Ref(contents))).unwrap();
+
+    let original = write_full(&doc, &SaveOptions::default()).unwrap();
+    let counts = scan(&doc);
+    assert_eq!(counts.iter().find(|(h, _)| *h == Hidden::HiddenLayers).map(|(_, n)| *n), Some(3), "{counts:?}");
+    assert_eq!(write_full(&doc, &SaveOptions::default()).unwrap(), original, "Verify scan must not mutate the document");
+}
+
+#[test]
+fn undecodable_form_is_counted_and_removed_by_hidden_layer_sanitization() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+
+    let mut doc = one_page(
+        b"/Bad Do",
+        "/XObject << /Bad 7 0 R >>",
+        vec![stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Filter /UnknownFilter", b"PRIVATE_UNDECODABLE_FORM")],
+    );
+    let counts = scan(&doc);
+    assert!(counts.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{counts:?}");
+    remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    assert!(!bytes.windows(b"PRIVATE_UNDECODABLE_FORM".len()).any(|w| w == b"PRIVATE_UNDECODABLE_FORM"));
+}
+
 #[test]
 fn hidden_ocmd_resolves_an_indirect_policy_name() {
     use crate::sanitize::{Hidden, remove_hidden};

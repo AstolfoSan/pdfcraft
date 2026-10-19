@@ -94,6 +94,9 @@ pub(crate) struct Scope<'a> {
     pub retained_off_layers: HashSet<ObjRef>,
     /// Cache membership results so repeated blocks cannot repeatedly walk hostile expressions.
     ocmd_cache: HashMap<ObjRef, bool>,
+    /// Direct `/OC` dictionaries on XObjects have no object reference of their own. Cache them
+    /// by the containing XObject so repeated `Do` calls share the same bounded evaluation.
+    xobject_oc_cache: HashMap<ObjRef, bool>,
     /// Content removed from hidden layers (blocks and XObjects).
     pub layer_blocks: usize,
     fonts: HashMap<Vec<u8>, Rc<Metrics>>,
@@ -112,6 +115,7 @@ impl<'a> Scope<'a> {
             layers_enabled: false,
             retained_off_layers: HashSet::new(),
             ocmd_cache: HashMap::new(),
+            xobject_oc_cache: HashMap::new(),
             layer_blocks: 0,
             fonts: HashMap::new(),
             used_names: Vec::new(),
@@ -189,6 +193,18 @@ impl<'a> Scope<'a> {
         if let Some(r) = reference {
             self.ocmd_cache.insert(r, hidden);
         }
+        hidden
+    }
+
+    fn xobject_layer_hidden(&mut self, doc: &Document, xobject: ObjRef, oc: &Object) -> bool {
+        if oc.as_ref().is_some() {
+            return self.layer_hidden(doc, oc);
+        }
+        if let Some(hidden) = self.xobject_oc_cache.get(&xobject) {
+            return *hidden;
+        }
+        let hidden = self.layer_hidden(doc, oc);
+        self.xobject_oc_cache.insert(xobject, hidden);
         hidden
     }
 
@@ -1113,11 +1129,13 @@ fn xobject(
     let obj = doc.get(r);
     let Object::Stream(s) = &*obj else { return None };
     match s.dict.name(b"Subtype") {
-        _ if s.dict.get(b"OC").is_some_and(|oc| scope.layer_hidden(doc, oc)) => {
+        _ if s.dict.get(b"OC").is_some_and(|oc| scope.xobject_layer_hidden(doc, r, oc)) => {
+            // Verify mode must count hidden XObjects too: scan uses that count to decide
+            // whether the HiddenLayers pass is necessary.
+            scope.layer_blocks += 1;
             if scope.mode == Mode::Verify {
                 return None;
             }
-            scope.layer_blocks += 1;
             out.replaced.push(name);
             out.doomed.push(r);
             Some(None)
@@ -1168,6 +1186,11 @@ fn xobject(
             }
             if scope.depth >= MAX_DEPTH {
                 if scope.mode == Mode::Verify {
+                    // Sanitization removes a Form it cannot enter, so the verification scan
+                    // must count that conservative removal or it may decide to skip the pass.
+                    if scope.everywhere() {
+                        scope.layer_blocks += 1;
+                    }
                     return None;
                 }
                 scope.report.forms_removed += 1;
@@ -1183,7 +1206,14 @@ fn xobject(
                     out.doomed.push(r);
                     return Some(None);
                 }
-                Err(_) => return None,
+                Err(_) => {
+                    // Apply drops an undecodable Form while sanitizing. Count it during Verify
+                    // so a zero-count preflight cannot leave its potentially hidden bytes behind.
+                    if scope.everywhere() {
+                        scope.layer_blocks += 1;
+                    }
+                    return None;
+                }
             };
             let own = s.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned());
             let res = own.clone().unwrap_or_else(|| resources.clone());
