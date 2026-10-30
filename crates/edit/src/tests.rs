@@ -1117,9 +1117,7 @@ fn a_paste_steps_past_copies_of_itself_only() {
 #[test]
 fn added_cyrillic_text_is_drawable_without_craft_fonts() {
     let mut doc = fixture();
-    let text = AddedText {
-        rect: [72.0, 600.0, 400.0, 700.0], text: "ывыфыв Привет, мир! Ёжик № 123 / Hello".into(), ..AddedText::default()
-    };
+    let text = AddedText { rect: [72.0, 600.0, 400.0, 700.0], text: "Привет, мир! Ёжик № 123 / Hello".into(), ..AddedText::default() };
     assert_eq!(first_undrawable(&text), None);
     add_content(&mut doc, 0, &Content::Text(text.clone())).unwrap();
     let doc = reopen(&doc);

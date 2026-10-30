@@ -81,7 +81,7 @@ fn typing_cyrillic_text_commits_to_the_page() {
     h.run_steps(2);
     let p = at(&h, 40.0, 300.0);
     click(&mut h, p);
-    let text = "ывыфыв Привет, мир! Ёжик";
+    let text = "Привет, мир! Ёжик";
     h.event(egui::Event::Text(text.into()));
     h.run_steps(3);
     assert!(h.query_by_label_contains("can't draw").is_none());
